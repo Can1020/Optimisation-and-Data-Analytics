@@ -1,533 +1,426 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import linprog
-from scipy.spatial import ConvexHull
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Tuple, Optional
+from typing import List, Dict, Any
+import sympy as sp
+from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application
 
-# Tolerance constants for numerical comparisons
+# --- CONFIGURATION ---
 TOLERANCE_PARALLEL = 1e-9
 TOLERANCE_CONSTRAINT = 1e-4
-MAX_CONSTRAINT_VALUE = 1e5
+MAX_PLOT_LIMIT = 1e4
 
-
-class OptimizationType(Enum):
-    """Enumeration for optimization type."""
-    MAXIMIZE = "maximize"
-    MINIMIZE = "minimize"
-    
-    def __str__(self):
-        return "MAXIMIZING" if self == OptimizationType.MAXIMIZE else "MINIMIZING"
-
+# Plotting constants
+PLOT_EXTENSION_FACTOR = 1.2
+PLOT_RESOLUTION = 400
+DEFAULT_PLOT_MIN = 10
+OBJECTIVE_LINE_WIDTH = 2.5
+OPTIMAL_POINT_SIZE = 10
+FEASIBLE_REGION_RESOLUTION = 500
+GRID_ALPHA = 0.3
+ANNOTATION_OFFSET_X = 10
+ANNOTATION_OFFSET_Y = 10
+ANNOTATION_BOX_PADDING = 0.3
+ANNOTATION_BOX_ALPHA = 0.8
 
 @dataclass
-class Constraint:
-    """Represents a linear constraint."""
-    coefficients: List[float]
-    rhs: float
+class Point2D:
+    """Represents a point in 2D space."""
+    x_coordinate: float
+    y_coordinate: float
     
-    @property
-    def coef1(self) -> float:
-        return self.coefficients[0]
-    
-    @property
-    def coef2(self) -> float:
-        return self.coefficients[1]
+    def __str__(self) -> str:
+        return f"({self.x_coordinate:.1f}, {self.y_coordinate:.1f})"
 
+@dataclass
+class LinearCoefficients:
+    """Represents coefficients of a linear equation: c1*x + c2*y = rhs."""
+    first_coefficient: float
+    second_coefficient: float
+    right_hand_side: float
+    
+    def is_vertical_line(self, tolerance: float = TOLERANCE_PARALLEL) -> bool:
+        """Check if the line is vertical (second coefficient near zero)."""
+        return abs(self.second_coefficient) < tolerance
+    
+    def calculate_y_value(self, x_value: np.ndarray) -> np.ndarray:
+        """Calculate y for given x: y = (rhs - c1*x) / c2."""
+        if self.is_vertical_line():
+            raise ValueError("Cannot calculate y-value for vertical line")
+        return (self.right_hand_side - self.first_coefficient * x_value) / self.second_coefficient
+    
+    def get_x_intercept(self) -> float:
+        """Get x-intercept for vertical or near-vertical lines."""
+        if self.first_coefficient == 0:
+            return 0.0
+        return self.right_hand_side / self.first_coefficient
+
+class OptimizationType(Enum):
+    MAXIMIZE = "maximize"
+    MINIMIZE = "minimize"
 
 @dataclass
 class LPProblem:
-    """Represents a Linear Programming problem."""
-    objective_coefficients: List[float]
-    inequality_constraints: List[Constraint]
-    equality_constraints: List[Constraint]
+    """Stores the LP definition using symbolic and numeric representations."""
+    variables: List[sp.Symbol]
     optimization_type: OptimizationType
-    
+    objective_expr: sp.Expr
+    constraints: List['ParsedConstraint'] = field(default_factory=list)
+
     @property
-    def c(self) -> List[float]:
-        return self.objective_coefficients
-    
-    def get_inequality_matrices(self) -> Tuple[Optional[List[List[float]]], Optional[List[float]]]:
-        """Convert inequality constraints to matrix form."""
-        if not self.inequality_constraints:
-            return None, None
-        A_ub = [c.coefficients for c in self.inequality_constraints]
-        b_ub = [c.rhs for c in self.inequality_constraints]
-        return A_ub, b_ub
-    
-    def get_equality_matrices(self) -> Tuple[Optional[List[List[float]]], Optional[List[float]]]:
-        """Convert equality constraints to matrix form."""
-        if not self.equality_constraints:
-            return None, None
-        A_eq = [c.coefficients for c in self.equality_constraints]
-        b_eq = [c.rhs for c in self.equality_constraints]
-        return A_eq, b_eq
-    
+    def objective_coefficients(self) -> List[float]:
+        """Extracts numerical coefficients for the objective function."""
+        coefficients = []
+        for variable in self.variables:
+            coefficient_value = float(self.objective_expr.coeff(variable))
+            coefficients.append(coefficient_value)
+        return coefficients
+
     def is_maximization(self) -> bool:
         return self.optimization_type == OptimizationType.MAXIMIZE
 
+@dataclass
+class ParsedConstraint:
+    """Stores a constraint derived from a symbolic expression."""
+    original_text: str
+    coefficients: List[float]
+    right_hand_side: float                
+    operator: str
+    
+    def to_linear_coefficients(self) -> LinearCoefficients:
+        """Convert to LinearCoefficients object."""
+        return LinearCoefficients(
+            first_coefficient=self.coefficients[0],
+            second_coefficient=self.coefficients[1],
+            right_hand_side=self.right_hand_side
+        )             
 
 @dataclass
 class Solution:
-    """Represents the solution to an LP problem."""
-    x1: float
-    x2: float
+    """Stores the optimal result."""
+    variable_values: Dict[str, float]
     objective_value: float
-    
-    def __str__(self):
-        return f"Z = {self.objective_value:.2f} at (x1={self.x1:.2f}, x2={self.x2:.2f})"
+    status_message: str
+    is_successful: bool
 
-def find_feasible_vertices(problem: LPProblem) -> np.ndarray:
-    """
-    Find all vertices of the feasible region by intersecting constraint lines.
-    """
-    lines = _collect_constraint_lines(problem)
-    intersection_points = _find_line_intersections(lines)
-    feasible_points = _filter_feasible_points(intersection_points, problem)
+    def __str__(self) -> str:
+        if not self.is_successful:
+            return f"No Solution: {self.status_message}"
+        
+        variables_string = ", ".join([f"{key}={value:.2f}" for key, value in self.variable_values.items()])
+        return f"Optimal Z = {self.objective_value:.2f} ({variables_string})"
     
-    return np.array(feasible_points) if feasible_points else np.array([])
+    def get_optimal_point(self) -> Point2D:
+        """Get the optimal solution as a Point2D."""
+        values = list(self.variable_values.values())
+        return Point2D(x_coordinate=values[0], y_coordinate=values[1])
 
+# --- INPUT PARSING LOGIC ---
 
-def _collect_constraint_lines(problem: LPProblem) -> List[Tuple[float, float, float]]:
-    """Collect all constraint lines including non-negativity constraints."""
-    lines = []
+def parse_user_input() -> LPProblem:
+    """Handles the interactive user input session."""
+    print("\n--- LINEAR PROGRAMMING SOLVER ---")
     
-    # Add inequality constraints
-    for constraint in problem.inequality_constraints:
-        lines.append((constraint.coef1, constraint.coef2, constraint.rhs))
+    # 1. Variable Setup
+    var_input = input("Enter decision variables (comma separated, e.g., 'A, B' or 'x, y'): ").strip()
+    var_names = [name.strip() for name in var_input.split(',')]
+    if len(var_names) != 2:
+        raise ValueError("This solver strictly supports exactly 2 variables.")
     
-    # Add equality constraints
-    for constraint in problem.equality_constraints:
-        lines.append((constraint.coef1, constraint.coef2, constraint.rhs))
+    # Create Sympy Symbols
+    symbols = [sp.Symbol(name) for name in var_names]
+    symbol_map = {name: symbol for name, symbol in zip(var_names, symbols)}
     
-    # Add non-negativity constraints: x1 >= 0, x2 >= 0
-    lines.extend([(1, 0, 0), (0, 1, 0)])
+    # 2. Optimization Goal
+    print("\nOptimization Goal:")
+    mode_string = input("Type 'max' to Maximize or 'min' to Minimize: ").strip().lower()
+    optimization_type = OptimizationType.MAXIMIZE if mode_string.startswith('max') else OptimizationType.MINIMIZE
     
-    return lines
-
-
-def _find_line_intersections(lines: List[Tuple[float, float, float]]) -> List[List[float]]:
-    """Find all intersection points between pairs of lines."""
-    intersections = []
+    # 3. Objective Function
+    objective_string = input(f"Enter Objective Function (e.g., '30*A + 10*B'): ")
+    if "=" in objective_string:
+        objective_string = objective_string.split("=")[1]
     
-    for i, line1 in enumerate(lines):
-        for line2 in lines[i + 1:]:
-            intersection = _intersect_two_lines(line1, line2)
-            if intersection is not None:
-                intersections.append(intersection)
+    objective_expr = _parse_expression_safely(objective_string, symbol_map)
     
-    return intersections
-
-
-def _intersect_two_lines(line1: Tuple[float, float, float], 
-                         line2: Tuple[float, float, float]) -> Optional[List[float]]:
-    """Find intersection point of two lines. Returns None if lines are parallel."""
-    a1, b1, rhs1 = line1
-    a2, b2, rhs2 = line2
-    
-    determinant = a1 * b2 - a2 * b1
-    
-    if abs(determinant) <= TOLERANCE_PARALLEL:
-        return None  # Lines are parallel
-    
-    x = (rhs1 * b2 - rhs2 * b1) / determinant
-    y = (a1 * rhs2 - a2 * rhs1) / determinant
-    
-    return [x, y]
-
-
-def _filter_feasible_points(points: List[List[float]], problem: LPProblem) -> List[List[float]]:
-    """Filter points that satisfy all constraints."""
-    return [point for point in points if _is_point_feasible(point, problem)]
-
-
-def _is_point_feasible(point: List[float], problem: LPProblem) -> bool:
-    """Check if a point satisfies all constraints."""
-    x, y = point
-    
-    # Check non-negativity
-    if x < -TOLERANCE_CONSTRAINT or y < -TOLERANCE_CONSTRAINT:
-        return False
-    
-    # Check inequality constraints
-    for constraint in problem.inequality_constraints:
-        value = constraint.coef1 * x + constraint.coef2 * y
-        if value > constraint.rhs + TOLERANCE_CONSTRAINT:
-            return False
-    
-    # Check equality constraints
-    for constraint in problem.equality_constraints:
-        value = constraint.coef1 * x + constraint.coef2 * y
-        if abs(value - constraint.rhs) > TOLERANCE_CONSTRAINT:
-            return False
-    
-    return True
-
-def get_user_input() -> LPProblem:
-    """Get LP problem parameters from user."""
-    _print_header()
-    
-    optimization_type = _get_optimization_type()
-    objective_coefficients = _get_objective_coefficients()
-    inequality_constraints, equality_constraints = _get_constraints()
-    
-    return LPProblem(
-        objective_coefficients=objective_coefficients,
-        inequality_constraints=inequality_constraints,
-        equality_constraints=equality_constraints,
-        optimization_type=optimization_type
-    )
-
-
-def _print_header():
-    """Print input header."""
-    print("\n" + "=" * 40)
-    print("LP PROBLEM INPUT")
-    print("=" * 40)
-
-
-def _get_optimization_type() -> OptimizationType:
-    """Ask user for optimization type."""
-    print("\nOptimization Type:")
-    print("  1. Maximize")
-    print("  2. Minimize")
-    
-    while True:
-        mode = input("Select (1/2): ").strip()
-        if mode == '1':
-            return OptimizationType.MAXIMIZE
-        elif mode == '2':
-            return OptimizationType.MINIMIZE
-        print("Invalid choice. Please enter 1 or 2.")
-
-def _get_objective_coefficients() -> List[float]:
-    """Get objective function coefficients from user."""
-    print("\nObjective Function: Z = c1*x1 + c2*x2")
-    
-    while True:
-        try:
-            c1 = float(input("  c1: "))
-            c2 = float(input("  c2: "))
-            
-            if c1 == 0 and c2 == 0:
-                print("Error: Both coefficients cannot be zero.")
-                continue
-            
-            return [c1, c2]
-        except ValueError:
-            print("Invalid input. Please enter numeric values.")
-
-def _get_constraints() -> Tuple[List[Constraint], List[Constraint]]:
-    """Get all constraints from user."""
-    inequality_constraints = []
-    equality_constraints = []
-    
-    print("\nConstraints:")
-    print("  Format: a b op rhs")
-    print("  Operators: <= (less or equal), >= (greater or equal), = (equal)")
-    print("  Example: 2 3 <= 10  means  2*x1 + 3*x2 <= 10")
-    print("  Type 'done' when finished.\n")
+    # 4. Constraints
+    constraints = []
+    print("\nEnter Constraints.")
+    print("Examples: '6*A + 3*B <= 40', 'B >= 3*A', 'A <= 4'.")
+    print("Type 'done' when finished.")
     
     count = 1
     while True:
-        entry = input(f"  Constraint {count}: ").strip()
-        
+        entry = input(f"Constraint {count}: ").strip()
         if entry.lower() == 'done':
             break
-        
-        constraint = _parse_constraint(entry)
-        if constraint is not None:
-            constraint_type, constraint_obj = constraint
-            if constraint_type == 'inequality':
-                inequality_constraints.append(constraint_obj)
-            else:
-                equality_constraints.append(constraint_obj)
+        if not entry:
+            continue
+            
+        try:
+            constraints.append(_parse_constraint_string(entry, symbols, symbol_map))
             count += 1
-    
-    if not inequality_constraints and not equality_constraints:
-        print("\n⚠ Warning: No constraints entered. Problem may be unbounded.")
-    
-    return inequality_constraints, equality_constraints
+        except (ValueError, KeyError, AttributeError) as error:
+            print(f"Error parsing constraint: {error}. Try again.")
 
+    return LPProblem(symbols, optimization_type, objective_expr, constraints)
 
-def _parse_constraint(entry: str) -> Optional[Tuple[str, Constraint]]:
-    """Parse a constraint string. Returns ('inequality'|'equality', Constraint) or None."""
-    try:
-        parts = entry.split()
-        if len(parts) != 4:
-            print("  Invalid format. Use: a b op rhs (e.g., '2 3 <= 10')")
-            return None
+def _parse_expression_safely(expression_string: str, symbol_dictionary: dict) -> sp.Expr:
+    """Parses a string into a Sympy expression with implicit multiplication support."""
+    transformations = standard_transformations + (implicit_multiplication_application,)
+    return parse_expr(expression_string, local_dict=symbol_dictionary, transformations=transformations)
+
+def _parse_constraint_string(constraint_text: str, variables: List[sp.Symbol], symbol_dictionary: dict) -> ParsedConstraint:
+    """
+    Converts a raw string like 'B >= 3A' into canonical linear form: ax + by <= c
+    """
+    operator = _extract_operator(constraint_text)
+    left_side_string, right_side_string = _split_by_operator(constraint_text, operator)
+    
+    left_expression = _parse_expression_safely(left_side_string, symbol_dictionary)
+    right_expression = _parse_expression_safely(right_side_string, symbol_dictionary)
+    
+    # Sympy expressions support subtraction but type checker doesn't recognize it
+    difference_expression = sp.Add(left_expression, -right_expression)
+    
+    coefficients = _extract_coefficients(difference_expression, variables)
+    constant_value = _extract_constant_term(difference_expression)
+    
+    normalized_coefficients = coefficients
+    normalized_rhs = -constant_value
+    
+    if operator == '>=':
+        normalized_coefficients = [-coefficient for coefficient in coefficients]
+        normalized_rhs = constant_value
         
-        coef1 = float(parts[0])
-        coef2 = float(parts[1])
-        operator = parts[2]
-        rhs = float(parts[3])
-        
-        if operator == '<=':
-            return ('inequality', Constraint([coef1, coef2], rhs))
-        elif operator == '>=':
-            # Convert >= to <= by multiplying by -1
-            return ('inequality', Constraint([-coef1, -coef2], -rhs))
-        elif operator == '=':
-            return ('equality', Constraint([coef1, coef2], rhs))
-        else:
-            print(f"  Invalid operator '{operator}'. Use: <=, >=, or =")
-            return None
-        
-    except ValueError:
-        print("  Invalid input. Use numeric values for a, b, and rhs.")
-        return None
-
-def solve_and_plot(problem: LPProblem, title: str = "LP Graphical Solution"):
-    """Solve LP problem and visualize the solution."""
-    _print_problem_header(problem)
-    _validate_problem(problem)
-    
-    solution = solve_lp_problem(problem)
-    if solution is None:
-        return
-    
-    print_solution(solution)
-    visualize_solution(problem, solution, title)
-
-
-def _print_problem_header(problem: LPProblem):
-    """Print problem information."""
-    print(f"\n{'=' * 50}")
-    print(f"{problem.optimization_type}: Z = {problem.c[0]}*x1 + {problem.c[1]}*x2")
-    print(f"{'=' * 50}")
-
-
-def _validate_problem(problem: LPProblem):
-    """Validate problem has constraints."""
-    if not problem.inequality_constraints and not problem.equality_constraints:
-        print("⚠ Warning: No constraints provided. Problem may be unbounded.")
-
-
-def solve_lp_problem(problem: LPProblem) -> Optional[Solution]:
-    """Solve the LP problem using scipy.linprog."""
-    try:
-        result = _run_linprog_solver(problem)
-        
-        if not result.success:
-            _print_solver_error(result.status, result.message)
-            return None
-        
-        return _create_solution_from_result(result, problem)
-        
-    except Exception as e:
-        print(f"\n✗ Calculation Error: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-
-def _run_linprog_solver(problem: LPProblem):
-    """Run scipy linprog solver."""
-    # linprog minimizes by default, negate coefficients for maximization
-    objective = ([-c for c in problem.c] 
-                if problem.is_maximization() 
-                else problem.c)
-    
-    bounds = [(0, None), (0, None)]  # Non-negativity
-    A_ub, b_ub = problem.get_inequality_matrices()
-    A_eq, b_eq = problem.get_equality_matrices()
-    
-    return linprog(objective, A_ub=A_ub, b_ub=b_ub,
-                  A_eq=A_eq, b_eq=b_eq,
-                  bounds=bounds, method='highs')
-
-
-def _create_solution_from_result(result, problem: LPProblem) -> Solution:
-    """Create Solution object from linprog result."""
-    x1, x2 = result.x
-    objective_value = result.fun * (-1 if problem.is_maximization() else 1)
-    
-    return Solution(x1=x1, x2=x2, objective_value=objective_value)
-
-def _print_solver_error(status: int, message: str):
-    """Print appropriate error message based on solver status."""
-    if status == 2:
-        print("\n✗ Problem is INFEASIBLE: No solution satisfies all constraints.")
-    elif status == 3:
-        print("\n✗ Problem is UNBOUNDED: Objective can increase/decrease indefinitely.")
-    else:
-        print(f"\n✗ Solver Error: {message}")
-
-
-def print_solution(solution: Solution):
-    """Print solution details."""
-    print(f"\n✓ Optimal Solution Found:")
-    print(f"  {solution}")
-
-def visualize_solution(problem: LPProblem, solution: Solution, title: str):
-    """Create visualization of the LP problem solution."""
-    try:
-        plt.figure(figsize=(10, 8))
-        
-        plot_limit = _calculate_plot_limit(problem, solution)
-        x_values = np.linspace(0, plot_limit, 400)
-        
-        feasible_points = find_feasible_vertices(problem)
-        _plot_feasible_region(feasible_points, plot_limit)
-        _plot_all_constraints(problem, x_values, plot_limit)
-        _plot_objective_line(problem, solution, x_values)
-        _plot_optimal_point(solution)
-        _configure_plot(plot_limit, title)
-        
-        plt.show()
-        
-    except Exception as e:
-        print(f"\n✗ Visualization Error: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-def _calculate_plot_limit(problem: LPProblem, solution: Solution) -> float:
-    """Calculate appropriate plot limits."""
-    values = [abs(solution.x1) * 1.5, abs(solution.x2) * 1.5, 10]
-    
-    for constraint in problem.inequality_constraints + problem.equality_constraints:
-        if abs(constraint.rhs) < MAX_CONSTRAINT_VALUE:
-            values.append(abs(constraint.rhs))
-    
-    return max(values) * 1.2
-def _plot_feasible_region(feasible_points: np.ndarray, plot_limit: float):
-    """Plot the feasible region."""
-    if len(feasible_points) == 0:
-        print("⚠ Warning: No feasible vertices found.")
-        plt.text(plot_limit / 2, plot_limit / 2, 'NO FEASIBLE REGION',
-                fontsize=16, ha='center', color='red', weight='bold')
-        return
-    
-    if len(feasible_points) >= 3:
-        hull = ConvexHull(feasible_points)
-        vertices = feasible_points[hull.vertices]
-        plt.fill(vertices[:, 0], vertices[:, 1], color='#d9f9d9',
-                alpha=0.5, label='Feasible Region')
-        plt.plot(np.append(vertices[:, 0], vertices[0, 0]),
-                np.append(vertices[:, 1], vertices[0, 1]),
-                'g-', linewidth=2)
-    elif len(feasible_points) == 2:
-        plt.plot(feasible_points[:, 0], feasible_points[:, 1],
-                'g-', linewidth=3, label='Feasible Line', marker='o')
-    else:
-        plt.plot(feasible_points[0, 0], feasible_points[0, 1],
-                'go', markersize=10, label='Feasible Point')
-
-
-def _plot_all_constraints(problem: LPProblem, x_values: np.ndarray, plot_limit: float):
-    """Plot all constraint lines."""
-    colors = plt.cm.get_cmap('tab10')
-    
-    for idx, constraint in enumerate(problem.inequality_constraints, 1):
-        _plot_constraint_line(constraint, '<=', idx, x_values, plot_limit, colors, '--')
-    
-    constraint_num = len(problem.inequality_constraints) + 1
-    for constraint in problem.equality_constraints:
-        _plot_constraint_line(constraint, '=', constraint_num, x_values, plot_limit, colors, '-')
-        constraint_num += 1
-
-
-def _plot_constraint_line(constraint: Constraint, operator: str, num: int,
-                         x_values: np.ndarray, plot_limit: float, colors, linestyle: str):
-    """Plot a single constraint line."""
-    color = colors(num % 10)
-    label = f'C{num}: {constraint.coef1:.1f}x1 + {constraint.coef2:.1f}x2 {operator} {constraint.rhs:.1f}'
-    linewidth = 2 if operator == '=' else 1.5
-    
-    if abs(constraint.coef2) > TOLERANCE_PARALLEL:
-        y_values = (constraint.rhs - constraint.coef1 * x_values) / constraint.coef2
-        plt.plot(x_values, y_values, label=label, color=color,
-                linestyle=linestyle, linewidth=linewidth, alpha=0.7)
-    elif abs(constraint.coef1) > TOLERANCE_PARALLEL:
-        x_line = constraint.rhs / constraint.coef1
-        if 0 <= x_line <= plot_limit:
-            plt.axvline(x=x_line, label=label, color=color,
-                       linestyle=linestyle, linewidth=linewidth, alpha=0.7)
-
-
-def _plot_objective_line(problem: LPProblem, solution: Solution, x_values: np.ndarray):
-    """Plot the objective function line at optimal value."""
-    c = problem.c
-    
-    if abs(c[1]) > TOLERANCE_PARALLEL:
-        y_values = (solution.objective_value - c[0] * x_values) / c[1]
-        plt.plot(x_values, y_values, 'r-', linewidth=3,
-                label=f'Objective: Z = {solution.objective_value:.2f}', alpha=0.8)
-    elif abs(c[0]) > TOLERANCE_PARALLEL:
-        plt.axvline(x=solution.x1, color='r', linewidth=3,
-                   label=f'Objective: Z = {solution.objective_value:.2f}', alpha=0.8)
-    else:
-        print("⚠ Warning: Both objective coefficients are near zero.")
-
-
-def _plot_optimal_point(solution: Solution):
-    """Plot the optimal solution point."""
-    plt.plot(solution.x1, solution.x2, 'ro', markersize=12,
-            markeredgecolor='black', markeredgewidth=2,
-            label='Optimal Solution', zorder=5)
-    
-    plt.annotate(f'({solution.x1:.1f}, {solution.x2:.1f})\nZ = {solution.objective_value:.1f}',
-                xy=(solution.x1, solution.x2), xytext=(10, 10),
-                textcoords='offset points', fontsize=11,
-                bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.7),
-                fontweight='bold')
-
-
-def _configure_plot(plot_limit: float, title: str):
-    """Configure plot appearance and labels."""
-    plt.xlim(0, plot_limit)
-    plt.ylim(0, plot_limit)
-    plt.xlabel('x1 (Decision Variable 1)', fontsize=12)
-    plt.ylabel('x2 (Decision Variable 2)', fontsize=12)
-    plt.title(title, fontsize=14, fontweight='bold')
-    plt.legend(loc='upper right', bbox_to_anchor=(1.25, 1), fontsize=9)
-    plt.grid(True, alpha=0.3, linestyle='--')
-    plt.tight_layout()
-
-
-def _create_pill_production_problem() -> LPProblem:
-    """Create the pill production optimization problem."""
-    return LPProblem(
-        objective_coefficients=[2, 1],
-        inequality_constraints=[
-            Constraint([3, 2], 1000),    # Ingredient: 3x1 + 2x2 <= 1000
-            Constraint([-1, 0], -100),   # x1 >= 100 -> -x1 <= -100
-            Constraint([3, -2], 0)       # x2 >= 0.6(x1+x2) -> 3x1 - 2x2 <= 0
-        ],
-        equality_constraints=[],
-        optimization_type=OptimizationType.MINIMIZE
+    return ParsedConstraint(
+        original_text=constraint_text,
+        coefficients=normalized_coefficients,
+        right_hand_side=normalized_rhs,
+        operator=operator
     )
 
-
-def _print_pill_production_info():
-    """Print information about the pill production problem."""
-    print("\n--- Loading IndustryOR 'Pill Production' Case ---")
-    print("Objective: Minimize Z = 2x1 + x2 (Filler Material)")
-    print("Constraint 1: 3x1 + 2x2 <= 1000 (Ingredients)")
-    print("Constraint 2: x1 >= 100 (Min Large Pills)")
-    print("Constraint 3: x2 >= 60% of Total Pills")
-
-
-# --- MAIN EXECUTION BLOCK ---
-if __name__ == "__main__":
-    print("GRAPHICAL LP SOLVER")
-    print("-------------------")
-    print("Choose Data Source:")
-    print("1. Enter Custom Data Manually")
-    print("2. Load 'IndustryOR' Real-World Test (Pill Production)")
-    
-    choice = input("Choice (1/2): ")
-    
-    if choice == '1':
-        problem = get_user_input()
-        solve_and_plot(problem)
-        
-    elif choice == '2':
-        problem = _create_pill_production_problem()
-        _print_pill_production_info()
-        solve_and_plot(problem, "IndustryOR: Pill Production Optimization")
+def _extract_operator(constraint_text: str) -> str:
+    """Extract the comparison operator from a constraint string."""
+    if '<=' in constraint_text:
+        return '<='
+    elif '>=' in constraint_text:
+        return '>='
+    elif '<' in constraint_text:
+        return '<='
+    elif '>' in constraint_text:
+        return '>='
+    elif '=' in constraint_text:
+        return '='
     else:
-        print("Invalid choice.")
+        raise ValueError("No comparison operator found (<=, >=, =)")
+
+def _split_by_operator(constraint_text: str, operator: str) -> tuple[str, str]:
+    """Split constraint text by its operator."""
+    if operator in ['<=', '>=']:
+        parts = constraint_text.split(operator)
+    elif '<' in constraint_text:
+        parts = constraint_text.split('<')
+    elif '>' in constraint_text:
+        parts = constraint_text.split('>')
+    else:
+        parts = constraint_text.split('=')
+    return parts[0], parts[1]
+
+def _extract_coefficients(expression: sp.Expr, variables: List[sp.Symbol]) -> List[float]:
+    """Extract coefficients for each variable from the expression."""
+    coefficients = []
+    polynomial = sp.Poly(expression, variables)
+    
+    for variable in variables:
+        try:
+            coefficient = float(polynomial.coeff_monomial(variable))
+        except (ValueError, TypeError):
+            coefficient = 0.0
+        coefficients.append(coefficient)
+    
+    return coefficients
+
+def _extract_constant_term(expression: sp.Expr) -> float:
+    """Extract the constant term from the expression."""
+    coefficients_dict = expression.as_coefficients_dict()
+    return float(coefficients_dict.get(1, 0))
+
+# --- SOLVER LOGIC ---
+
+def solve_lp(problem: LPProblem) -> Solution:
+    """Solve the linear programming problem using scipy's linprog."""
+    objective_coefficients = problem.objective_coefficients
+    if problem.is_maximization():
+        objective_coefficients = [-value for value in objective_coefficients]
+        
+    inequality_matrix = []
+    inequality_bounds = []
+    equality_matrix = []
+    equality_bounds = []
+    
+    for constraint in problem.constraints:
+        if constraint.operator == '=':
+            equality_matrix.append(constraint.coefficients)
+            equality_bounds.append(constraint.right_hand_side)
+        else:
+            inequality_matrix.append(constraint.coefficients)
+            inequality_bounds.append(constraint.right_hand_side)
+            
+    variable_bounds = [(0, None), (0, None)]
+    
+    result = linprog(
+        objective_coefficients,
+        A_ub=inequality_matrix if inequality_matrix else None,
+        b_ub=inequality_bounds if inequality_bounds else None,
+        A_eq=equality_matrix if equality_matrix else None,
+        b_eq=equality_bounds if equality_bounds else None,
+        bounds=variable_bounds,
+        method='highs'
+    )
+    
+    if result.success:
+        objective_value = result.fun * (-1 if problem.is_maximization() else 1)
+        variable_map = {str(variable): value for variable, value in zip(problem.variables, result.x)}
+        return Solution(variable_map, objective_value, result.message, True)
+    else:
+        return Solution({}, 0.0, result.message, False)
+
+# --- VISUALIZATION LOGIC ---
+
+def visualize_result(problem: LPProblem, solution: Solution) -> None:
+    """Visualize the linear programming problem and its solution."""
+    if not solution.is_successful:
+        print("Cannot visualize: No feasible solution found.")
+        return
+
+    plt.figure(figsize=(10, 8))
+    
+    plot_limit = _calculate_plot_limit(solution, problem.constraints)
+    x_values = np.linspace(0, plot_limit, PLOT_RESOLUTION)
+    
+    _setup_axes()
+    _plot_constraints(problem.constraints, x_values, plot_limit)
+    _plot_feasible_region(problem.constraints, plot_limit)
+    _plot_objective_function(problem, solution, x_values)
+    _plot_optimal_point(problem, solution)
+    _configure_plot_appearance(problem, plot_limit)
+    
+    plt.show()
+
+def _calculate_plot_limit(solution: Solution, constraints: List[ParsedConstraint]) -> float:
+    """Calculate appropriate plot limit based on solution and constraints."""
+    values = list(solution.variable_values.values())
+    max_value = max(max(values) if values else 0, DEFAULT_PLOT_MIN)
+    
+    for constraint in constraints:
+        if constraint.right_hand_side < MAX_PLOT_LIMIT:
+            max_value = max(max_value, abs(constraint.right_hand_side))
+    
+    return max_value * PLOT_EXTENSION_FACTOR
+
+def _setup_axes() -> None:
+    """Set up the x and y axes."""
+    plt.axvline(0, color='black', linewidth=1)
+    plt.axhline(0, color='black', linewidth=1)
+
+def _plot_constraints(constraints: List[ParsedConstraint], x_values: np.ndarray, plot_limit: float) -> None:
+    """Plot all constraint lines."""
+    color_map = plt.cm.get_cmap('tab10')
+    
+    for index, constraint in enumerate(constraints):
+        color = color_map(index % 10)
+        coefficients = constraint.to_linear_coefficients()
+        
+        if coefficients.is_vertical_line():
+            _plot_vertical_constraint(coefficients, constraint, color, plot_limit)
+        else:
+            _plot_standard_constraint(coefficients, constraint, x_values, color, plot_limit)
+
+def _plot_vertical_constraint(coefficients: LinearCoefficients, constraint: ParsedConstraint, color: Any, plot_limit: float) -> None:
+    """Plot a vertical line constraint."""
+    x_intercept = coefficients.get_x_intercept()
+    plt.axvline(x_intercept, color=color, linestyle='--', label=constraint.original_text)
+
+def _plot_standard_constraint(coefficients: LinearCoefficients, constraint: ParsedConstraint, 
+                              x_values: np.ndarray, color: Any, plot_limit: float) -> None:
+    """Plot a standard (non-vertical) constraint."""
+    y_values = coefficients.calculate_y_value(x_values)
+    plt.plot(x_values, y_values, color=color, linestyle='--', label=constraint.original_text)
+
+def _plot_feasible_region(constraints: List[ParsedConstraint], plot_limit: float) -> None:
+    """Plot the feasible region where all constraints are satisfied."""
+    # Create a mesh grid
+    x_mesh = np.linspace(0, plot_limit, FEASIBLE_REGION_RESOLUTION)
+    y_mesh = np.linspace(0, plot_limit, FEASIBLE_REGION_RESOLUTION)
+    X, Y = np.meshgrid(x_mesh, y_mesh)
+    
+    # Initialize with all points feasible (non-negativity constraints satisfied)
+    feasible_region = np.ones_like(X, dtype=bool)
+    
+    # Check each constraint
+    for constraint in constraints:
+        first_coefficient = constraint.coefficients[0]
+        second_coefficient = constraint.coefficients[1]
+        right_hand_side = constraint.right_hand_side
+        
+        # Calculate constraint satisfaction: first_coeff*x + second_coeff*y <= rhs
+        constraint_satisfied = (first_coefficient * X + second_coefficient * Y) <= right_hand_side
+        
+        # Intersection with existing feasible region
+        feasible_region = feasible_region & constraint_satisfied
+    
+    # Plot the feasible region with transparency
+    plt.contourf(X, Y, feasible_region.astype(float), levels=[0.5, 1.5], colors=['green'], alpha=0.3)
+
+def _plot_objective_function(problem: LPProblem, solution: Solution, x_values: np.ndarray) -> None:
+    """Plot the objective function line at the optimal value."""
+    objective_coefficients = problem.objective_coefficients
+    optimal_value = solution.objective_value
+    
+    if abs(objective_coefficients[1]) > TOLERANCE_PARALLEL:
+        y_objective = (optimal_value - objective_coefficients[0] * x_values) / objective_coefficients[1]
+        plt.plot(x_values, y_objective, 'r-', linewidth=OBJECTIVE_LINE_WIDTH, 
+                label=f'Objective Z={optimal_value:.1f}')
+
+def _plot_optimal_point(problem: LPProblem, solution: Solution) -> None:
+    """Plot and annotate the optimal solution point."""
+    optimal_point = solution.get_optimal_point()
+    
+    plt.plot(optimal_point.x_coordinate, optimal_point.y_coordinate, 'ro', 
+            markersize=OPTIMAL_POINT_SIZE, zorder=5, label='Optimal Solution')
+    
+    plt.annotate(
+        str(optimal_point),
+        (optimal_point.x_coordinate, optimal_point.y_coordinate),
+        xytext=(ANNOTATION_OFFSET_X, ANNOTATION_OFFSET_Y),
+        textcoords='offset points',
+        bbox=dict(boxstyle=f"round,pad={ANNOTATION_BOX_PADDING}", 
+                 fc="white", ec="black", alpha=ANNOTATION_BOX_ALPHA)
+    )
+
+def _configure_plot_appearance(problem: LPProblem, plot_limit: float) -> None:
+    """Configure the plot's labels, limits, and styling."""
+    plt.xlim(0, plot_limit)
+    plt.ylim(0, plot_limit)
+    plt.xlabel(str(problem.variables[0]))
+    plt.ylabel(str(problem.variables[1]))
+    plt.title(f"LP Optimization: {problem.optimization_type.name}")
+    plt.legend()
+    plt.grid(True, alpha=GRID_ALPHA)
+
+# --- MAIN ---
+def main() -> None:
+    """Main entry point for the linear programming solver."""
+    try:
+        problem_definition = parse_user_input()
+        solution = solve_lp(problem_definition)
+        print("\n" + str(solution))
+        visualize_result(problem_definition, solution)
+    except (ValueError, KeyError, AttributeError) as error:
+        print(f"\nAn error occurred: {error}")
+
+if __name__ == "__main__":
+    main()
